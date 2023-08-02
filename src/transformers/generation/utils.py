@@ -1535,7 +1535,7 @@ class GenerationMixin:
                 )
 
             # 11. run greedy search
-            return self.greedy_search(
+            yield from self.greedy_search(
                 input_ids,
                 logits_processor=logits_processor,
                 stopping_criteria=stopping_criteria,
@@ -2344,6 +2344,7 @@ class GenerationMixin:
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
         this_peer_finished = False  # used by synced_gpus only
+        stopped, len_limit = False, False
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -2404,7 +2405,7 @@ class GenerationMixin:
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             if streamer is not None:
-                streamer.put(next_tokens.cpu())
+                yield from streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
@@ -2418,16 +2419,15 @@ class GenerationMixin:
                 # stop when each sentence is finished
                 if unfinished_sequences.max() == 0:
                     this_peer_finished = True
+                    stopped = True
 
             # stop if we exceed the maximum length
             if stopping_criteria(input_ids, scores):
                 this_peer_finished = True
+                len_limit = True
 
             if this_peer_finished and not synced_gpus:
                 break
-
-        if streamer is not None:
-            streamer.end()
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:
@@ -2447,8 +2447,13 @@ class GenerationMixin:
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                 )
+        elif streamer is not None:
+            if stopped:
+                yield from streamer.end(stopped=True, len_limit=False)
+            elif len_limit:
+                yield from streamer.end(stopped=False, len_limit=True)
         else:
-            return input_ids
+            yield input_ids
 
     def sample(
         self,
